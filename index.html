@@ -2012,6 +2012,21 @@ const supabaseClient = window.supabase.createClient(
         }
 
         let _delGroupId = null;
+        // مستحقات "كل مجموعات الصف" بتتحذف لما ما يفضلش أي طالب في الصف بعد الحذف
+        function orphanGradePlans(g, stIds) {
+            if (!stIds.size) return [];
+            if (students.some(s => !stIds.has(s.id) && gradeOf(s) === g.grade)) return [];
+            return paymentPlans.filter(p => p.groupId === 'ALL' && p.grade === g.grade);
+        }
+        // كويزات "كل المجموعات" اللي كانت بتنطبق على المجموعة وما فضلش أي طالب ينطبق عليها بعد الحذف
+        function orphanGradeExams(g, stIds) {
+            if (!stIds.size) return [];
+            const fits = (e, st) => (!e.targetGrade || e.targetGrade === 'ALL' || gradeOf(st) === e.targetGrade) && (!e.targetGroupId || e.targetGroupId === 'ALL' || st.groupId === e.targetGroupId);
+            return exams.filter(e => e.targetGroupId !== g.id
+                && (!e.targetGrade || e.targetGrade === 'ALL' || e.targetGrade === g.grade)
+                && (!e.targetGroupId || e.targetGroupId === 'ALL')
+                && !students.some(st => !stIds.has(st.id) && fits(e, st)));
+        }
         function deleteGroup(id) {
             const g = groups.find(x => x.id === id);
             if (!g) return;
@@ -2019,15 +2034,19 @@ const supabaseClient = window.supabase.createClient(
             const stIds = new Set(students.filter(s => s.groupId === id).map(s => s.id));
             const plans = paymentPlans.filter(p => p.groupId === id);
             const grpExams = exams.filter(e => e.targetGroupId === id);
+            const gradeExams = orphanGradeExams(g, stIds);
             const nLogs = logs.filter(l => stIds.has(l.studentId)).length;
             const nGrades = examGrades.filter(r => stIds.has(r.studentId)).length;
             const nPays = studentPayments.filter(r => stIds.has(r.studentId)).length;
+            const gradePlans = orphanGradePlans(g, stIds);
             $id('dgTitle').textContent = `حذف المجموعة "${g.name}"`;
             const li = t => `<div>• ${t}</div>`;
             $id('dgInfo').innerHTML =
                 li(`عدد الطلاب في المجموعة: ${stIds.size}`) +
                 (plans.length ? li(`${plans.length} مستحق مالي مخصص للمجموعة (هيتحذف مع سجلات دفعه في الحالتين)`) : '') +
+                (gradePlans.length ? li(`${gradePlans.length} مستحق لكل مجموعات ${esc(g.grade)} (هيتحذف مع سجلات دفعه لو اخترت حذف الطلاب وما فضلش طالب في الصف)`) : '') +
                 (grpExams.length ? li(`${grpExams.length} امتحان مخصص للمجموعة (هيتحذف مع درجاته في الحالتين)`) : '') +
+                (gradeExams.length ? li(`${gradeExams.length} كويز لكل المجموعات (هيتحذف مع درجاته لو اخترت حذف الطلاب وما فضلش طالب ينطبق عليه)`) : '') +
                 (stIds.size ? li(`بيانات الطلاب: ${nLogs} سجل حضور • ${nGrades} درجة • ${nPays} سجل دفع`) : '');
             $id('dgWithStudentsBtn').classList.toggle('hidden', stIds.size === 0);
             $id('deleteGroupModal').classList.remove('hidden');
@@ -2037,9 +2056,10 @@ const supabaseClient = window.supabase.createClient(
             if (!g) { closeModal('deleteGroupModal'); return; }
             const stIds = withStudents ? new Set(students.filter(s => s.groupId === id).map(s => s.id)) : new Set();
             if (withStudents && !confirm(`تحذير: سيتم حذف ${stIds.size} طالب نهائياً مع كل سجلاتهم (الحضور، التقييمات، الدرجات، المدفوعات). لا يمكن التراجع. هل أنت متأكد؟`)) return;
-            const plans = paymentPlans.filter(p => p.groupId === id);
-            const grpExams = exams.filter(e => e.targetGroupId === id);
+            const plans = paymentPlans.filter(p => p.groupId === id).concat(orphanGradePlans(g, stIds));
+            const grpExams = exams.filter(e => e.targetGroupId === id).concat(orphanGradeExams(g, stIds));
             const planIds = new Set(plans.map(p => p.id)), examIds = new Set(grpExams.map(e => e.id));
+            const nPaysDeleted = studentPayments.filter(r => planIds.has(r.planId) || stIds.has(r.studentId)).length;
 
             groups = groups.filter(x => x.id !== id);
             paymentPlans = paymentPlans.filter(p => !planIds.has(p.id));
@@ -2062,7 +2082,7 @@ const supabaseClient = window.supabase.createClient(
             _delGroupId = null;
             refreshGroupViews();
             renderLogsTable();
-            showToast(withStudents ? "تم حذف المجموعة مع الطلاب وكل بياناتهم" : "تم حذف المجموعة، والطلاب بقوا بدون مجموعة", "info");
+            showToast(withStudents ? `تم حذف المجموعة مع الطلاب وكل بياناتهم (شامل ${nPaysDeleted} سجل دفع)` : "تم حذف المجموعة، والطلاب بقوا بدون مجموعة", "info");
         }
 
         // ===== عرض طلاب المجموعة =====
@@ -2427,6 +2447,8 @@ const supabaseClient = window.supabase.createClient(
 
             if (!autoGroup) {
                 playStatusSound('ERROR');
+                document.getElementById('scanResultBox').innerHTML = `<div class="w-16 h-16 bg-rose-100 text-rose-600 rounded-full flex items-center justify-center text-2xl mb-3"><i class="fa-solid fa-user-slash"></i></div><h3 class="font-bold text-rose-600 text-base">الطالب غير مضاف في أي مجموعة حالية!</h3><p class="text-xs font-bold text-[#0F172A] mt-1">${esc(student.name)} (ID: ${esc(student.code)})</p>`;
+                showDueBar(student);
                 showToast("الطالب غير مضاف في أي مجموعة حالية!", "error");
                 return;
             }
@@ -2434,6 +2456,7 @@ const supabaseClient = window.supabase.createClient(
             if ((autoGroup.cancelled || []).includes(localDate()) && !($id('scanOverride') && $id('scanOverride').checked)) {
                 playStatusSound('ERROR');
                 document.getElementById('scanResultBox').innerHTML = `<div class="w-16 h-16 bg-amber-100 text-amber-600 rounded-full flex items-center justify-center text-2xl mb-3"><i class="fa-solid fa-ban"></i></div><h3 class="font-bold text-amber-600 text-base">حصة ${esc(autoGroup.name)} ملغاة اليوم</h3><p class="text-xs font-bold text-[#0F172A] mt-1">${esc(student.name)}</p>`;
+                showDueBar(student);
                 showToast('حصة هذه المجموعة ملغاة اليوم', 'error');
                 return;
             }
@@ -2450,6 +2473,7 @@ const supabaseClient = window.supabase.createClient(
                     <p class="text-xs text-[#64748B] mt-1">مجموعته: <span class="font-bold text-[#2563EB]">${esc(autoGroup.name)}</span></p>
                     <p class="text-xs text-rose-600 font-bold mt-1">أيام الحضور المسموحة: ${esc(autoGroup.days)}</p>
                 `;
+                showDueBar(student);
                 showToast(`عفواً! اليوم ليس موعد مجموعة ${student.name}`, "error");
                 return;
             }
@@ -2466,6 +2490,7 @@ const supabaseClient = window.supabase.createClient(
                         <h3 class="font-bold text-amber-600 text-base">تسجيل الحضور لم يبدأ بعد!</h3>
                         <p class="text-xs font-bold text-[#0F172A] mt-1">${esc(student.name)} (ID: ${esc(student.code)})</p>
                         <p class="text-xs text-[#64748B] mt-1">يفتح التسجيل لـ ${esc(autoGroup.name)} قبل الموعد بـ ${CHECKIN_OPEN_BEFORE_MIN} دقيقة (الساعة ${fmtMin(w.open)}).</p>`;
+                    showDueBar(student);
                     showToast(`التسجيل لم يبدأ — يفتح الساعة ${fmtMin(w.open)}`, 'error');
                     return;
                 }
@@ -2478,6 +2503,7 @@ const supabaseClient = window.supabase.createClient(
                         <p class="text-xs font-bold text-[#0F172A] mt-1">${esc(student.name)} (ID: ${esc(student.code)})</p>
                         <p class="text-xs text-[#64748B] mt-1">انتهى تسجيل حضور ${esc(autoGroup.name)} الساعة ${fmtMin(w.absentFrom)} (بعد ${ABSENCE_GRACE_MIN} دقيقة من موعد الحصة).</p>
                         <p class="text-xs text-rose-600 font-bold mt-1">لتغيير حالته: سجل الحضور ← تعديل الحالة</p>`;
+                    showDueBar(student);
                     showToast(`وقت التسجيل انتهى — لا يمكن تسجيل حضور ${student.name}`, 'error');
                     runAutoAbsence(true, autoGroup.id);
                     return;
